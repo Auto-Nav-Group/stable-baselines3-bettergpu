@@ -1,6 +1,7 @@
 from typing import Any, ClassVar, Dict, List, Optional, Tuple, Type, TypeVar, Union
 
 import numpy as np
+import torch
 import torch as th
 from gymnasium import spaces
 from torch.nn import functional as F
@@ -75,6 +76,7 @@ class SAC(OffPolicyAlgorithm):
     :param device: Device (cpu, cuda, ...) on which the code should be run.
         Setting it to auto, the code will be run on the GPU if possible.
     :param _init_setup_model: Whether or not to build the network at the creation of the instance
+    :param use_amp: Whether or not to use automatic mixed precision (AMP) for the training (fp16). Only useful for certain GPUs (e.g. RTX series)
     """
 
     policy_aliases: ClassVar[Dict[str, Type[BasePolicy]]] = {
@@ -116,6 +118,7 @@ class SAC(OffPolicyAlgorithm):
         seed: Optional[int] = None,
         device: Union[th.device, str] = "auto",
         _init_setup_model: bool = True,
+        use_amp: bool = False,
     ):
         super().__init__(
             policy,
@@ -152,6 +155,9 @@ class SAC(OffPolicyAlgorithm):
         self.ent_coef = ent_coef
         self.target_update_interval = target_update_interval
         self.ent_coef_optimizer: Optional[th.optim.Adam] = None
+        self.use_amp = use_amp
+        self.min_scale_value = 1
+        self.grad_scaler = th.cuda.amp.GradScaler(enabled=self.use_amp, growth_interval=100)
 
         if _init_setup_model:
             self._setup_model()
@@ -211,80 +217,83 @@ class SAC(OffPolicyAlgorithm):
         actor_losses, critic_losses = [], []
 
         for gradient_step in range(gradient_steps):
-            # Sample replay buffer
-            replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)  # type: ignore[union-attr]
+            with th.autocast(device_type=self.device.type, dtype=th.float16, enabled=self.use_amp):# Sample replay buffer
+                replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)  # type: ignore[union-attr]
 
-            # We need to sample because `log_std` may have changed between two gradient steps
-            if self.use_sde:
-                self.actor.reset_noise()
+                # We need to sample because `log_std` may have changed between two gradient steps
+                if self.use_sde:
+                    self.actor.reset_noise()
 
-            # Action by the current actor for the sampled state
-            actions_pi, log_prob = self.actor.action_log_prob(replay_data.observations)
-            log_prob = log_prob.reshape(-1, 1)
+                # Action by the current actor for the sampled state
+                actions_pi, log_prob = self.actor.action_log_prob(replay_data.observations)
+                log_prob = log_prob.reshape(-1, 1)
 
-            ent_coef_loss = None
-            if self.ent_coef_optimizer is not None and self.log_ent_coef is not None:
-                # Important: detach the variable from the graph
-                # so we don't change it with other losses
-                # see https://github.com/rail-berkeley/softlearning/issues/60
-                ent_coef = th.exp(self.log_ent_coef.detach())
-                ent_coef_loss = -(self.log_ent_coef * (log_prob + self.target_entropy).detach()).mean()
-                ent_coef_losses.append(ent_coef_loss.item())
-            else:
-                ent_coef = self.ent_coef_tensor
+                ent_coef_loss = None
+                if self.ent_coef_optimizer is not None and self.log_ent_coef is not None:
+                    # Important: detach the variable from the graph
+                    # so we don't change it with other losses
+                    # see https://github.com/rail-berkeley/softlearning/issues/60
+                    ent_coef = th.exp(self.log_ent_coef.detach())
+                    ent_coef_loss = -(self.log_ent_coef * (log_prob + self.target_entropy).detach()).mean()
+                    ent_coef_losses.append(ent_coef_loss.item())
+                else:
+                    ent_coef = self.ent_coef_tensor
 
-            ent_coefs.append(ent_coef.item())
+                ent_coefs.append(ent_coef.item())
 
             # Optimize entropy coefficient, also called
             # entropy temperature or alpha in the paper
             if ent_coef_loss is not None and self.ent_coef_optimizer is not None:
                 self.ent_coef_optimizer.zero_grad()
-                ent_coef_loss.backward()
-                self.ent_coef_optimizer.step()
+                self.grad_scaler.scale(ent_coef_loss).backward()
+                self.grad_scaler.step(self.ent_coef_optimizer)
 
-            with th.no_grad():
-                # Select action according to policy
-                next_actions, next_log_prob = self.actor.action_log_prob(replay_data.next_observations)
-                # Compute the next Q values: min over all critics targets
-                next_q_values = th.cat(self.critic_target(replay_data.next_observations, next_actions), dim=1)
-                next_q_values, _ = th.min(next_q_values, dim=1, keepdim=True)
-                # add entropy term
-                next_q_values = next_q_values - ent_coef * next_log_prob.reshape(-1, 1)
-                # td error + entropy term
-                target_q_values = replay_data.rewards + (1 - replay_data.dones) * self.gamma * next_q_values
+            with th.autocast(device_type=self.device.type, dtype=th.float16, enabled=self.use_amp):
+                with th.no_grad():
+                    # Select action according to policy
+                    next_actions, next_log_prob = self.actor.action_log_prob(replay_data.next_observations)
+                    # Compute the next Q values: min over all critics targets
+                    next_q_values = th.cat(self.critic_target(replay_data.next_observations, next_actions), dim=1)
+                    next_q_values, _ = th.min(next_q_values, dim=1, keepdim=True)
+                    # add entropy term
+                    next_q_values = next_q_values - ent_coef * next_log_prob.reshape(-1, 1)
+                    # td error + entropy term
+                    target_q_values = replay_data.rewards + (1 - replay_data.dones) * self.gamma * next_q_values
 
-            # Get current Q-values estimates for each critic network
-            # using action from the replay buffer
-            current_q_values = self.critic(replay_data.observations, replay_data.actions)
+                # Get current Q-values estimates for each critic network
+                # using action from the replay buffer
+                current_q_values = self.critic(replay_data.observations, replay_data.actions)
 
-            # Compute critic loss
-            critic_loss = 0.5 * sum(F.mse_loss(current_q, target_q_values) for current_q in current_q_values)
-            assert isinstance(critic_loss, th.Tensor)  # for type checker
-            critic_losses.append(critic_loss.item())  # type: ignore[union-attr]
+                # Compute critic loss
+                critic_loss = 0.5 * sum(F.mse_loss(current_q, target_q_values) for current_q in current_q_values)
+                assert isinstance(critic_loss, th.Tensor)  # for type checker
+                critic_losses.append(critic_loss.item())  # type: ignore[union-attr]
 
             # Optimize the critic
             self.critic.optimizer.zero_grad()
-            critic_loss.backward()
-            self.critic.optimizer.step()
+            self.grad_scaler.scale(critic_loss).backward()
+            self.grad_scaler.step(self.critic.optimizer)
 
-            # Compute actor loss
-            # Alternative: actor_loss = th.mean(log_prob - qf1_pi)
-            # Min over all critic networks
-            q_values_pi = th.cat(self.critic(replay_data.observations, actions_pi), dim=1)
-            min_qf_pi, _ = th.min(q_values_pi, dim=1, keepdim=True)
-            actor_loss = (ent_coef * log_prob - min_qf_pi).mean()
-            actor_losses.append(actor_loss.item())
+            with th.autocast(device_type=self.device.type, dtype=th.float16, enabled=self.use_amp):
+                # Compute actor loss
+                # Alternative: actor_loss = th.mean(log_prob - qf1_pi)
+                # Min over all critic networks
+                q_values_pi = th.cat(self.critic(replay_data.observations, actions_pi), dim=1)
+                min_qf_pi, _ = th.min(q_values_pi, dim=1, keepdim=True)
+                actor_loss = (ent_coef * log_prob - min_qf_pi).mean()
+                actor_losses.append(actor_loss.item())
 
             # Optimize the actor
             self.actor.optimizer.zero_grad()
-            actor_loss.backward()
-            self.actor.optimizer.step()
-
+            self.grad_scaler.scale(actor_loss).backward()
+            self.grad_scaler.step(self.actor.optimizer)
+            self.grad_scaler.update()
             # Update target networks
             if gradient_step % self.target_update_interval == 0:
                 polyak_update(self.critic.parameters(), self.critic_target.parameters(), self.tau)
                 # Copy running stats, see GH issue #996
                 polyak_update(self.batch_norm_stats, self.batch_norm_stats_target, 1.0)
+
 
         self._n_updates += gradient_steps
 
