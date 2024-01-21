@@ -215,7 +215,6 @@ class SAC(OffPolicyAlgorithm):
 
         ent_coef_losses, ent_coefs = [], []
         actor_losses, critic_losses = [], []
-
         for gradient_step in range(gradient_steps):
             with th.autocast(device_type=self.device.type, dtype=th.float16, enabled=self.use_amp):# Sample replay buffer
                 replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)  # type: ignore[union-attr]
@@ -293,8 +292,6 @@ class SAC(OffPolicyAlgorithm):
                 polyak_update(self.critic.parameters(), self.critic_target.parameters(), self.tau)
                 # Copy running stats, see GH issue #996
                 polyak_update(self.batch_norm_stats, self.batch_norm_stats_target, 1.0)
-
-
         self._n_updates += gradient_steps
 
         self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
